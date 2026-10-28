@@ -1,0 +1,80 @@
+[package]
+name = "rstsc"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "rstsc: a Linux Remote Desktop client replicating mstsc (IronRDP engine), egui GUI"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# RDP protocol suite (facade re-exports the client engine, input database, cliprdr backends).
+#
+# Pinned to a git revision instead of crates.io on purpose: the published
+# releases (ironrdp 0.17 / ironrdp-client 0.1, July 2026) predate features
+# this client depends on — DesktopUpdate dirty-region blits, MonitorLayout
+# input events with resize reactivation, AutoReconnectDecision responses,
+# output_channel drop policies and display-config-driven resize fallbacks.
+# When a release that contains those lands, move back to a plain crates.io
+# version and drop this comment.
+ironrdp = { git = "https://github.com/Devolutions/IronRDP", rev = "a0c8c0dc1e1296f428092d3158585cfc7d395efb", features = [
+    "client",
+    "rustls",
+    "client-clipboard",
+    "client-gateway",
+    "client-rdpdr",
+    "client-openh264",
+    "client-video",
+    "client-location",
+    "input",
+    "pdu",
+    "cliprdr",
+    "rdpei",
+    "connector",
+    "displaycontrol",
+    "graphics",
+    "session",
+] }
+nix = { version = "0.31", features = ["poll"] }
+x11rb = { version = "0.13", features = ["xfixes"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+ironrdp-cliprdr = { git = "https://github.com/Devolutions/IronRDP", rev = "a0c8c0dc1e1296f428092d3158585cfc7d395efb" }
+ironrdp-core = { git = "https://github.com/Devolutions/IronRDP", rev = "a0c8c0dc1e1296f428092d3158585cfc7d395efb" }
+ironrdp-cliprdr-format = { git = "https://github.com/Devolutions/IronRDP", rev = "a0c8c0dc1e1296f428092d3158585cfc7d395efb" }
+ironrdp-rdpdr-native = { git = "https://github.com/Devolutions/IronRDP", rev = "a0c8c0dc1e1296f428092d3158585cfc7d395efb" }
+ironrdp-rdpfile = { git = "https://github.com/Devolutions/IronRDP", rev = "a0c8c0dc1e1296f428092d3158585cfc7d395efb" }
+ironrdp-tls = { git = "https://github.com/Devolutions/IronRDP", rev = "a0c8c0dc1e1296f428092d3158585cfc7d395efb" }
+
+# GUI
+eframe = "0.37"
+egui = "0.37"
+image = { version = "0.25", default-features = false, features = ["png"] }
+rfd = "0.17"
+
+# Async runtime for the session driver thread
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+
+# Misc
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+dirs = "6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+smallvec = "1.15"
+chacha20poly1305 = "0.11.0"
+rand = "0.8.5"
+base64 = "0.23.1"
+argon2 = { version = "0.6.0", default-features = false, features = ["alloc"] }
+zeroize = { version = "1.9.1", default-features = false }
+
+[features]
+default = []
+# Requires alsa-lib-devel (ALSA headers) at build time; enables remote audio playback/capture.
+audio = ["ironrdp/client-sound"]
+# RD Gateway over HTTPS (MS-TSGU). Kept default-on via ironrdp feature list above.
+gateway = []
+
+[profile.release]
+lto = "thin"

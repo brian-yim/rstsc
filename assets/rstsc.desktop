@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=rstsc
+GenericName=Remote Desktop Client
+Comment=Connect to Windows hosts over RDP (mstsc-style)
+Exec=rstsc %u
+TryExec=rstsc
+Icon=rstsc
+Terminal=false
+Categories=Network;RemoteAccess;Utility;
+Keywords=rdp;mstsc;remote desktop;windows;xrdp;
+StartupNotify=true
+# RDP URLs (mstsc://host/ style) can be opened straight into a quick connect.
+MimeType=x-scheme-handler/rdp;
