@@ -816,17 +816,18 @@ impl App {
                                                 }
                                             }
                                         }
+                                        // The vault owns passwords. Locked
+                                        // vault = no remember, no error:
+                                        // the UI already keeps the checkbox
+                                        // disabled, so just forget the flag.
+                                        if p.remember_password && !vault.is_unlocked() {
+                                            p.remember_password = false;
+                                        }
                                         // Passwords live in the encrypted
                                         // vault when "remember" is on;
                                         // profiles.json never sees them.
                                         if p.remember_password && !p.password.is_empty() {
-                                            if !vault.is_unlocked() {
-                                                state.error = Some(
-                                                    "Password vault is locked — \
-                                                         sign in first"
-                                                        .to_owned(),
-                                                );
-                                            } else if let Err(error) =
+                                            if let Err(error) =
                                                 vault.set_password(&p.name, &p.password)
                                             {
                                                 state.error = Some(error.to_string());
@@ -837,13 +838,7 @@ impl App {
                                         // Gateway password rides along in
                                         // the vault when a remember flag is
                                         // set and a gateway is configured.
-                                        if p.remember_password && !vault.is_unlocked() {
-                                            state.error = Some(
-                                                "Password vault is locked — \
-                                                     sign in first"
-                                                    .to_owned(),
-                                            );
-                                        } else if let Some(gateway) = &mut p.gateway
+                                        if let Some(gateway) = &mut p.gateway
                                             && p.remember_password
                                         {
                                             if gateway.password.is_empty() {
@@ -1002,10 +997,23 @@ impl App {
 
                                         ui.label("Remember:");
                                         ui.horizontal(|ui| {
-                                            ui.checkbox(
-                                                &mut state.draft.remember_password,
-                                                "save password (encrypted vault)",
+                                            let vault_open = vault.is_unlocked();
+                                            let remember_row = ui.add_enabled(
+                                                vault_open,
+                                                egui::Checkbox::new(
+                                                    &mut state.draft.remember_password,
+                                                    "save password (encrypted vault)",
+                                                ),
                                             );
+                                            if !vault_open {
+                                                remember_row.on_disabled_hover_text(
+                                                    "Vault is locked — sign in on the \
+                                                     lock screen to remember passwords",
+                                                );
+                                                // Turning the vault off must
+                                                // not leave the flag set.
+                                                state.draft.remember_password = false;
+                                            }
                                         });
                                         ui.end_row();
                                     });

@@ -94,7 +94,9 @@ Legend: ✅ works · ⚠️ partial (protocol supported, UX incomplete) · ❌ n
   Remember, Display, Advanced), with the **Connect** / **Open .rdp…** action
   row pinned at the bottom of the column — the form scrolls, the buttons
   don't. The password field is masked; a small 👁/‥ button beside it reveals
-  it until toggled back.
+  it until toggled back. *Remember* is only enabled while the vault is
+  unlocked; with the vault skipped or signed out the checkbox is disabled
+  and the saved flag is dropped.
 - Profile naming is free-form; empty falls back to the host part of the
   address. Renaming a profile moves its stored password **and** sealed
   settings with it.
