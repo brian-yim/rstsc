@@ -26,6 +26,36 @@ const KDF_PARALLELISM: u8 = 1;
 const SALT_LEN: usize = 16;
 const VERSION: u8 = 1;
 
+/// `entries` key prefix marking a sealed full [`crate::profile::Profile`]
+/// blob. A bare (unprefixed) key seals that profile's password only, the v1
+/// layout kept for compatibility.
+const PROFILE_KEY_PREFIX: &str = "profile/";
+
+/// Strips the [`PROFILE_KEY_PREFIX`] and returns the profile name.
+fn profile_key_name(key: &str) -> Option<&str> {
+    key.strip_prefix(PROFILE_KEY_PREFIX)
+}
+
+/// Splits raw entry keys into (password-only names, full-profile names).
+fn split_entry_names<'a, I>(keys: I) -> (std::collections::BTreeSet<String>, std::collections::BTreeSet<String>)
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    let mut names = std::collections::BTreeSet::new();
+    let mut profile_names = std::collections::BTreeSet::new();
+    for key in keys {
+        match profile_key_name(key) {
+            Some(name) => {
+                profile_names.insert(name.to_owned());
+            }
+            None => {
+                names.insert(key.clone());
+            }
+        }
+    }
+    (names, profile_names)
+}
+
 #[derive(Serialize, Deserialize)]
 struct VaultFile {
     version: u8,
@@ -46,6 +76,9 @@ pub struct Vault {
     /// Cache of the entries so the UI can show which profiles have a stored
     /// password without decrypting anything.
     names: std::collections::BTreeSet<String>,
+    /// Names with a sealed full-profile blob (`profile/<name>` key). Empty in
+    /// v1 vaults until a save or migration seals them.
+    profile_names: std::collections::BTreeSet<String>,
 }
 
 fn b64(data: &[u8]) -> String {
@@ -113,6 +146,7 @@ impl Vault {
             key: Some(Key::default()),
             salt,
             names: Default::default(),
+            profile_names: Default::default(),
         }
     }
     pub fn path() -> std::path::PathBuf {
@@ -137,6 +171,7 @@ impl Vault {
                 key: None,
                 salt,
                 names: Default::default(),
+            profile_names: Default::default(),
             });
         }
         let data = std::fs::read(&path)?;
@@ -150,11 +185,13 @@ impl Vault {
             anyhow::bail!("vault KDF salt has the wrong length");
         }
         salt.copy_from_slice(&salt_vec);
+        let (names, profile_names) = split_entry_names(parsed.entries.keys());
         Ok(Self {
             path: path.to_path_buf(),
             key: None,
             salt,
-            names: parsed.entries.keys().cloned().collect(),
+            names,
+            profile_names,
         })
     }
 
@@ -191,7 +228,9 @@ impl Vault {
                 self.salt = unb64(&parsed.kdf_salt)?
                     .try_into()
                     .map_err(|_| anyhow::anyhow!("vault KDF salt has the wrong length"))?;
-                self.names = parsed.entries.keys().cloned().collect();
+                let (names, profile_names) = split_entry_names(parsed.entries.keys());
+                self.names = names;
+                self.profile_names = profile_names;
                 return Ok(());
             }
         }
@@ -278,6 +317,105 @@ impl Vault {
         self.names.iter().map(String::as_str)
     }
 
+    /// Names with a sealed full profile (v2). Metadata only, no decryption.
+    pub fn stored_profile_names(&self) -> impl Iterator<Item = &str> {
+        self.profile_names.iter().map(String::as_str)
+    }
+
+    /// Seals the full `profile` under `profile/<name>`. The profile JSON may
+    /// contain a password field; the seal covers it, so nothing lends itself
+    /// to plaintext on disk. Requires an unlocked vault.
+    pub fn set_profile(&mut self, name: &str, profile: &crate::profile::Profile) -> anyhow::Result<()> {
+        let key = self
+            .key
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("vault is locked; set the master passphrase first"))?;
+        let mut entries = self.read_entries()?;
+        if entries.is_empty() && !self.path.exists() {
+            if let Some(parent) = self.path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let blob = seal(key, serde_json::to_vec(profile)?.as_slice())?;
+        entries.insert(format!("{PROFILE_KEY_PREFIX}{name}"), blob);
+        self.lock_write(VaultFile {
+            version: VERSION,
+            kdf_salt: b64(&self.salt),
+            entries,
+        })?;
+        self.profile_names.insert(name.to_owned());
+        Ok(())
+    }
+
+    /// Unseals and deserializes the stored full profile for `name`.
+    /// Returns `None` when only the v1 password entry exists.
+    pub fn profile(&self, name: &str) -> anyhow::Result<Option<crate::profile::Profile>> {
+        let key = self
+            .key
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("vault is locked; set the master passphrase first"))?;
+        let entries = self.read_entries()?;
+        let Some(blob) = entries.get(&format!("{PROFILE_KEY_PREFIX}{name}")) else {
+            return Ok(None);
+        };
+        let pt = open(key, blob)?;
+        serde_json::from_slice(&pt)
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("stored profile is corrupt: {e}"))
+    }
+
+    /// Removes the sealed profile entry for `name` (no error when absent).
+    /// The password entry (if any) stays; removal is keyed independently.
+    pub fn remove_profile(&mut self, name: &str) -> anyhow::Result<()> {
+        let mut entries = self.read_entries()?;
+        if entries.remove(&format!("{PROFILE_KEY_PREFIX}{name}")).is_some() {
+            self.lock_write(VaultFile {
+                version: VERSION,
+                kdf_salt: b64(&self.salt),
+                entries,
+            })?;
+        }
+        self.profile_names.remove(name);
+        Ok(())
+    }
+
+    /// Unseals every sealed profile. Order: sorted by name (entries map is a
+    /// BTreeMap, so iteration is already name-keyed). Passwords are NOT
+    /// rehydrated here — the app layer merges them from the entries.
+    pub fn profiles(&self) -> anyhow::Result<Vec<crate::profile::Profile>> {
+        let key = self
+            .key
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("vault is locked; set the master passphrase first"))?;
+        let entries = self.read_entries()?;
+        let mut out = Vec::new();
+        for (name, blob) in &entries {
+            let Some(profile_name) = profile_key_name(name) else {
+                continue;
+            };
+            match open(key, blob) {
+                Ok(pt) => match serde_json::from_slice::<crate::profile::Profile>(&pt) {
+                    Ok(mut p) => {
+                        // The blob is settings-only; merge the password entry
+                        // (if any) so callers get launch-ready profiles.
+                        if let Ok(Some(pwd)) = self.password(profile_name) {
+                            p.password = pwd;
+                        }
+                        out.push(p);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, profile = %profile_name, "sealed profile unreadable; skipping");
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!(%error, profile = %profile_name, "sealed profile decrypted badly; skipping");
+                }
+            }
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
     fn read_entries(&self) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
         if !self.path.exists() {
             return Ok(Default::default());
@@ -291,8 +429,9 @@ impl Vault {
     }
 
     /// Writes plaintext `legacy profiles.json` passwords into the vault and
-    /// scrubs them from the JSON. Idempotent: only profiles without a vault
-    /// entry are migrated.
+    /// scrubs them from the JSON. Also seals the full profile (v2) so the
+    /// vault owns the whole record. Idempotent: only profiles without a
+    /// vault entry are migrated.
     pub fn migrate_plaintext(&mut self, profiles: &mut [crate::profile::Profile]) -> usize {
         let mut migrated = 0usize;
         for p in profiles {
@@ -302,7 +441,15 @@ impl Vault {
             if self.names.contains(&p.name) {
                 continue;
             }
-            if self.set_password(&p.name, &p.password).is_err() {
+            let mut sealed = p.clone();
+            let password = std::mem::take(&mut sealed.password);
+            // The sealed profile carries settings only; the password lives in
+            // its own entry (one ciphertext of the secret, not two) and
+            // rehydration merges them on launch.
+            if self.set_profile(&p.name, &sealed).is_err() {
+                continue;
+            }
+            if self.set_password(&p.name, &password).is_err() {
                 continue;
             }
             migrated += 1;
@@ -347,6 +494,7 @@ mod tests {
             key: None,
             salt: [0_u8; SALT_LEN],
             names: Default::default(),
+            profile_names: Default::default(),
         };
         assert!(vault.unlock("correct horse battery").is_ok());
         vault.set_password("office", "P@ssw0rd!").unwrap();
@@ -370,6 +518,80 @@ mod tests {
     }
 
     #[test]
+    fn profile_seal_roundtrip() {
+        let path = unique_path("profilert");
+        let mut vault = Vault {
+            path: path.clone(),
+            key: None,
+            salt: [0_u8; SALT_LEN],
+            names: Default::default(),
+            profile_names: Default::default(),
+        };
+        vault.unlock("correct horse battery").is_ok();
+        let mut p = crate::profile::Profile::new("winbox.example.com:3390");
+        p.username = "CORP\\alice".to_owned();
+        vault.set_profile(&p.name, &p).unwrap();
+
+        // The profile *name* is the entries key (metadata, same as v1
+        // password keys); the sealed blob must not leak settings.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        // Key names are expected metadata; check the *value* blob alone.
+        let parsed: VaultFile = serde_json::from_str(&raw).unwrap();
+        let blob = parsed
+            .entries
+            .get(&format!("{PROFILE_KEY_PREFIX}{}", p.name))
+            .unwrap();
+        assert!(!blob.contains("winbox"), "address leaked in blob");
+        assert!(!blob.contains("CORP"), "username leaked in blob");
+
+        let round = vault.profile(&p.name).unwrap().unwrap();
+        assert_eq!(round, p);
+        assert!(vault.stored_profile_names().any(|n| n == p.name));
+
+        // Remove.
+        vault.remove_profile(&p.name).unwrap();
+        assert_eq!(vault.profile(&p.name).unwrap(), None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn profile_rename_moves_both_entries() {
+        let path = unique_path("profilerename");
+        let mut vault = Vault {
+            path: path.clone(),
+            key: None,
+            salt: [0_u8; SALT_LEN],
+            names: Default::default(),
+            profile_names: Default::default(),
+        };
+        vault.unlock("k").unwrap();
+        let mut p = crate::profile::Profile::new("old-host");
+        p.username = "alice".to_owned();
+        vault.set_profile("old-host", &p).unwrap();
+        vault.set_password("old-host", "pw1").unwrap();
+
+        // The UI's rename sequence: carry the password to the new key, drop
+        // the old entries, seal the settings under the new name.
+        let mut renamed = p.clone();
+        renamed.name = "new-host".to_owned();
+        let pwd = vault.password("old-host").unwrap().unwrap();
+        vault.set_password("new-host", &pwd).unwrap();
+        vault.remove_password("old-host").unwrap();
+        vault.set_profile("new-host", &renamed).unwrap();
+        vault.remove_profile("old-host").unwrap();
+
+        assert!(vault.profile("new-host").unwrap().is_some());
+        assert_eq!(vault.password("new-host").unwrap().as_deref(), Some("pw1"));
+        assert_eq!(vault.profile("old-host").unwrap(), None);
+        assert_eq!(vault.password("old-host").unwrap(), None);
+        // Bulk read sees only the renamed profile.
+        let all = vault.profiles().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].name, "new-host");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn wrong_passphrase_is_rejected() {
         let path = unique_path("wrongpass");
         let mut vault = Vault {
@@ -377,6 +599,7 @@ mod tests {
             key: None,
             salt: [0_u8; SALT_LEN],
             names: Default::default(),
+            profile_names: Default::default(),
         };
         vault.unlock("master-pass-1").unwrap();
         vault.set_password("host-a", "secret").unwrap();
@@ -404,6 +627,7 @@ mod tests {
             key: None,
             salt: [0_u8; SALT_LEN],
             names: Default::default(),
+            profile_names: Default::default(),
         };
         vault.unlock("master").unwrap();
         assert_eq!(vault.migrate_plaintext(&mut profiles), 1);
@@ -417,5 +641,30 @@ mod tests {
         assert!(!raw.contains("legacy-secret"));
         // Idempotent.
         assert_eq!(vault.migrate_plaintext(&mut profiles), 0);
+    }
+
+    /// The exact `apply_unlock` sequence against a real vault file sealed
+    /// offline (passphrase "smokepassphraseone"). Skipped when the file is
+    /// absent so plain `cargo test` stays hermetic.
+    #[test]
+    fn real_file_unlock_and_profile_merge() {
+        let path = match std::env::var("RSTSC_SMOKE_VAULT") {
+            Ok(p) => std::path::PathBuf::from(p),
+            Err(_) => return,
+        };
+        if !path.exists() {
+            return;
+        }
+        let mut v = Vault::load_with_path(&path).expect("load");
+        assert!(!v.is_unlocked());
+        let passphrase = std::env::var("RSTSC_SMOKE_PASS")
+            .unwrap_or_else(|_| "smokepassphraseone".into());
+        v.unlock(&passphrase).expect("unlock");
+        let profiles = v.profiles().expect("profiles");
+        assert_eq!(profiles.len(), 1, "one sealed profile expected");
+        let p = &profiles[0];
+        assert_eq!(p.name, "legacy-host");
+        assert!(!p.password.is_empty(), "password merged from its own entry");
+        assert_eq!(p.password, v.password("legacy-host").unwrap().unwrap());
     }
 }

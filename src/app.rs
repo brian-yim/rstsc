@@ -123,12 +123,41 @@ impl App {
         }
     }
 
+    /// Profile list for the manager. v2: the vault owns the truth when it is
+    /// readable; `profiles.json` is the pre-unlock fallback (CLI launch) and
+    /// for locked-vault sessions.
+    fn load_profile_list(vault: &vault::Vault) -> (Vec<Profile>, bool) {
+        let json_profiles = profile::load_profiles().unwrap_or_default();
+        if !vault.is_unlocked() {
+            return (json_profiles, false);
+        }
+        match vault.profiles() {
+            Ok(vaulted) if !vaulted.is_empty() => (vaulted, true),
+            Ok(_) => {
+                // First v2 run over a v1 vault: keep the JSON copy; the
+                // seal-on-next-save path fills the vault.
+                (json_profiles, false)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not read sealed profiles; falling back to profiles.json");
+                (json_profiles, false)
+            }
+        }
+    }
+
     pub fn new(_cc: &eframe::CreationContext<'_>, launch: Launch) -> Self {
-        let profiles = profile::load_profiles().unwrap_or_default();
         let mut vault = vault::Vault::load().unwrap_or_else(|error| {
             tracing::warn!(%error, "Could not read the password vault; remembered passwords unavailable");
             vault::Vault::fresh()
         });
+        // Sealed profiles load only after unlock; pre-unlock the JSON copy
+        // is used for CLI address/profile matching.
+        let (profiles, _profiles_from_vault) =
+            if vault.is_unlocked() {
+                Self::load_profile_list(&vault)
+            } else {
+                (profile::load_profiles().unwrap_or_default(), false)
+            };
         // Every launch mode starts at the vault gate; CLI launches resume
         // after the passphrase is in. Refreshing the draft needs the vault
         // (rehydration), so the manager is built after the launch profile.
@@ -265,6 +294,15 @@ impl App {
             if let Err(error) = profile::save_profiles(&self.profiles) {
                 tracing::warn!(%error, "could not rewrite profiles.json after migration");
             }
+        }
+        // v2: sealed profiles are the manager's list once the vault is open
+        // (passwords merged by `Vault::profiles`).
+        if let Ok(vaulted) = self.vault.profiles() {
+            if !vaulted.is_empty() {
+                self.profiles = vaulted;
+            }
+        } else {
+            tracing::warn!("vault open but sealed profiles unreadable; keeping profiles.json copy");
         }
         // Move the deferred CLI launch (if any) into the flow, then let the
         // manager take over: it seeds the draft and fires `pending_launch`
@@ -520,16 +558,36 @@ impl App {
                         ui.add_space(12.0);
                         ui.horizontal(|ui| {
                             let label = if state.creating { "Create vault" } else { "Unlock" };
-                            if ui.add(crate::theme::primary_button(label)).clicked() {
+                            let submitted = ui
+                                .add_sized(
+                                    [ui.available_width(), 34.0],
+                                    crate::theme::primary_button(label),
+                                )
+                                .clicked();
+                            if submitted {
                                 outcome = Some(LockOutcome::Unlock {
                                     passphrase: state.passphrase.clone(),
                                     confirm: state.confirm.clone(),
                                 });
                             }
-                            if state.creating && ui.button("Skip").clicked() {
+                        });
+                        if state.creating {
+                            ui.add_space(4.0);
+                            if ui.add_sized(
+                                [ui.available_width(), 28.0],
+                                egui::Button::new("Skip"),
+                            ).clicked() {
                                 outcome = Some(LockOutcome::Skip);
                             }
-                        });
+                        }
+                        // Enter in either field submits (mstsc-style login).
+                        let want_submit = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if want_submit {
+                            outcome = Some(LockOutcome::Unlock {
+                                passphrase: state.passphrase.clone(),
+                                confirm: state.confirm.clone(),
+                            });
+                        }
                         if let Some(error) = &state.error {
                             ui.add_space(8.0);
                             ui.label(egui::RichText::new(error).color(crate::theme::DANGER));
@@ -553,6 +611,7 @@ impl App {
         // Vault actions gathered from the frame; applied after drawing.
         let mut vault_sign_in = false;
         let mut vault_kill = false;
+        let mut new_profile = false;
         ui.allocate_ui_with_layout(
             ui.available_size(),
             egui::Layout::left_to_right(egui::Align::Min),
@@ -569,14 +628,74 @@ impl App {
                             .show(ui, |ui| {
                                 ui.set_width(256.0);
                                 ui.set_min_height(ui.available_height());
-                                ui.label(egui::RichText::new("rstsc").strong().size(17.0));
-                                ui.add_space(2.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("rstsc").strong().size(17.0));
+                                    // Ghost-style sign out pinned to the
+                                    // header's right edge.
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if vault.is_unlocked()
+                                                && ui
+                                                    .add(egui::Button::new(
+                                                        egui::RichText::new("Sign out")
+                                                            .size(11.0)
+                                                            .color(crate::theme::TEXT_MUTED),
+                                                    ))
+                                                    .on_hover_text(
+                                                        "Lock the vault and forget the \
+                                                         master passphrase until next sign-in",
+                                                    )
+                                                    .clicked()
+                                            {
+                                                vault_kill = true;
+                                            }
+                                        },
+                                    );
+                                });
+                                ui.add_space(6.0);
                                 ui.label(egui::RichText::new("Saved connections").weak().small());
+                                ui.add_space(2.0);
+                                // Vault state lives with the saved list it
+                                // protects: locked → sign-in affordance.
+                                if vault.is_unlocked() {
+                                    let stored = vault.stored_names().count();
+                                    ui.label(
+                                        egui::RichText::new(match stored {
+                                            0 => "vault unlocked · no passwords".to_owned(),
+                                            1 => "vault unlocked · 1 password".to_owned(),
+                                            n => format!("vault unlocked · {n} passwords"),
+                                        })
+                                        .weak()
+                                        .small(),
+                                    );
+                                } else if vault::Vault::exists() {
+                                    if ui
+                                        .link("🔒 vault locked — sign in")
+                                        .clicked()
+                                    {
+                                        vault_sign_in = true;
+                                    }
+                                } else if ui.link("🔒 set up vault").clicked() {
+                                    vault_sign_in = true;
+                                }
+                                ui.add_space(6.0);
+                                // Explicit "start a fresh profile" affordance:
+                                // clears the selection and the draft form.
+                                if ui
+                                    .add_sized(
+                                        [ui.available_width(), 24.0],
+                                        egui::Button::new(egui::RichText::new("＋ New").weak()),
+                                    )
+                                    .clicked()
+                                {
+                                    new_profile = true;
+                                }
                                 ui.add_space(6.0);
 
                                 let mut picked = None;
                                 let mut connect_now = None;
-                                let list_height = (ui.available_height() - 96.0).max(80.0);
+                                let list_height = (ui.available_height() - 124.0).max(80.0);
                                 egui::ScrollArea::vertical()
                                     .max_height(list_height)
                                     .auto_shrink([false, false])
@@ -639,12 +758,16 @@ impl App {
                                                 .unwrap_or(&p.address)
                                                 .to_owned();
                                         }
+                                        let old_name = state
+                                            .selected
+                                            .map(|i| profiles[i].name.clone());
+                                        let renaming = old_name.is_some()
+                                            && old_name.as_ref() != Some(&p.name);
                                         // Renaming a profile must carry its
                                         // stored password to the new key.
-                                        if let Some(i) = state.selected
-                                            && profiles[i].name != p.name
+                                        if renaming
+                                            && let Some(old) = old_name.clone()
                                         {
-                                            let old = profiles[i].name.clone();
                                             match vault.password(&old) {
                                                 Ok(Some(pwd)) => {
                                                     let _ = vault.set_password(&p.name, &pwd);
@@ -654,7 +777,7 @@ impl App {
                                                 Err(error) => {
                                                     // Locked vault: keep the
                                                     // plaintext-profile path
-                                                    // (nothing to migrate).
+                                                    // nothing to migrate.
                                                     tracing::warn!(
                                                         %error,
                                                         profile = %old,
@@ -671,7 +794,7 @@ impl App {
                                             if !vault.is_unlocked() {
                                                 state.error = Some(
                                                     "Password vault is locked — \
-                                                         set the master passphrase below first"
+                                                         sign in first"
                                                         .to_owned(),
                                                 );
                                             } else if let Err(error) =
@@ -688,7 +811,7 @@ impl App {
                                         if p.remember_password && !vault.is_unlocked() {
                                             state.error = Some(
                                                 "Password vault is locked — \
-                                                     set the master passphrase below first"
+                                                     sign in first"
                                                     .to_owned(),
                                             );
                                         } else if let Some(gateway) = &mut p.gateway
@@ -709,16 +832,26 @@ impl App {
                                         }
                                         // The profile on disk intentionally
                                         // carries no password.
-                                        p.password.clear();
+                                        let password = std::mem::take(&mut p.password);
                                         p.remember_password =
                                             p.remember_password && vault.has_password(&p.name);
+                                        if vault.is_unlocked() {
+                                            // v2: seal the full settings-only
+                                            // profile in the vault.
+                                            if let Err(error) = vault.set_profile(&p.name, &p) {
+                                                state.error = Some(error.to_string());
+                                            }
+                                            if renaming
+                                                && let Some(old) = old_name
+                                            {
+                                                let _ = vault.remove_profile(&old);
+                                            }
+                                        }
                                         let mut p = p;
                                         if vault.has_password(&p.name) {
                                             // Re-fetch the password so the
                                             // pending draft/launch has it.
-                                            if let Ok(Some(pwd)) = vault.password(&p.name) {
-                                                p.password = pwd;
-                                            }
+                                            p.password = password;
                                         }
                                         if let Some(i) = state.selected {
                                             profiles[i] = p.clone();
@@ -748,7 +881,14 @@ impl App {
                                             tracing::warn!(
                                                 %error,
                                                 profile = %removed.name,
-                                                "could not remove the vault entry"
+                                                "could not remove the vault password entry"
+                                            );
+                                        }
+                                        if let Err(error) = vault.remove_profile(&removed.name) {
+                                            tracing::warn!(
+                                                %error,
+                                                profile = %removed.name,
+                                                "could not remove the sealed profile entry"
                                             );
                                         }
                                         state.error = profile::save_profiles(profiles)
@@ -819,57 +959,6 @@ impl App {
                                                 &mut state.draft.remember_password,
                                                 "save password (encrypted vault)",
                                             );
-                                        });
-                                        ui.end_row();
-
-                                        ui.label("Vault:");
-                                        ui.horizontal(|ui| {
-                                            if vault.is_unlocked() {
-                                                let stored = vault.stored_names().count();
-                                                ui.label(
-                                                    egui::RichText::new(match stored {
-                                                        0 => "unlocked, no passwords stored"
-                                                            .to_owned(),
-                                                        1 => {
-                                                            "unlocked, 1 password stored".to_owned()
-                                                        }
-                                                        n => format!(
-                                                            "unlocked, {n} passwords stored"
-                                                        ),
-                                                    })
-                                                    .weak(),
-                                                );
-                                                if ui
-                                                    .button("Sign out")
-                                                    .on_hover_text(
-                                                        "Forget the unlocked master passphrase \
-                                                     until you sign in again",
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    vault_kill = true;
-                                                }
-                                            } else if vault::Vault::exists() {
-                                                if ui
-                                                    .button("Sign in…")
-                                                    .on_hover_text(
-                                                        "Enter the master passphrase on the \
-                                                         lock screen to enable saved passwords",
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    vault_sign_in = true;
-                                                }
-                                            } else if ui
-                                                .button("Set up…")
-                                                .on_hover_text(
-                                                    "Create the master passphrase that protects \
-                                                     saved passwords",
-                                                )
-                                                .clicked()
-                                            {
-                                                vault_sign_in = true;
-                                            }
                                         });
                                         ui.end_row();
                                     });
@@ -1124,6 +1213,15 @@ impl App {
                 });
             },
         );
+
+        // "+ New": clear the selection and reset the draft form so the next
+        // Save appends. Applied after the frame so a same-click list pick
+        // cannot re-fill the draft.
+        if new_profile {
+            state.selected = None;
+            state.error = None;
+            state.draft = Profile::new(String::new());
+        }
 
         // Vault sign-in/sign-out declared in the frame, applied here outside
         // the borrows. Sign-in hands over to the lock screen; sign-out drops
