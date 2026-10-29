@@ -54,6 +54,8 @@ struct ManagerState {
     draft: Profile,
     selected: Option<usize>,
     error: Option<String>,
+    /// Password field shows dots until the user asks to review it.
+    show_password: bool,
 }
 struct SessionState {
     profile: Profile,
@@ -197,6 +199,7 @@ impl App {
                 draft,
                 selected: None,
                 error: rdp_error,
+                show_password: false,
             }))
         } else {
             Screen::Lock(Box::new(LockState {
@@ -270,6 +273,7 @@ impl App {
             draft,
             selected: None,
             error,
+            show_password: false,
         }));
     }
 
@@ -440,8 +444,21 @@ impl eframe::App for App {
                     // Zeroize the passphrases no matter how the unlock goes.
                 }
                 Some(LockOutcome::Skip) => {
-                    // Fresh-vault skip: use the app with no stored passwords.
+                    // Bypass: no vault access at all. The deferred CLI
+                    // launch (if any) proceeds, but any vault-rehydrated
+                    // password is stripped so nothing decrypts on skip.
+                    if let Some((p, _)) = self.launch_after_unlock.as_mut() {
+                        p.password.clear();
+                        if let Some(gateway) = &mut p.gateway {
+                            gateway.password.clear();
+                        }
+                    }
                     self.back_to_manager(None);
+                    // Manager works from the non-vault copy (profiles.json /
+                    // CLI arg); no vault reads, no rehydration.
+                    for p in self.profiles.iter_mut() {
+                        p.password.clear();
+                    }
                 }
                 None => {}
             }
@@ -573,12 +590,24 @@ impl App {
                         });
                         if state.creating {
                             ui.add_space(4.0);
-                            if ui.add_sized(
+                        }
+                        // Skip works in both modes: create (no vault yet) or
+                        // unlock (locked vault). Bypassing never touches the
+                        // vault or imported profiles.
+                        if ui
+                            .add_sized(
                                 [ui.available_width(), 28.0],
-                                egui::Button::new("Skip"),
-                            ).clicked() {
-                                outcome = Some(LockOutcome::Skip);
-                            }
+                                egui::Button::new(egui::RichText::new("Skip").weak()),
+                            )
+                            .on_hover_text(if state.creating {
+                                "Use the app without stored passwords"
+                            } else {
+                                "Continue without decrypting the vault; \
+                                 saved passwords stay locked"
+                            })
+                            .clicked()
+                        {
+                            outcome = Some(LockOutcome::Skip);
                         }
                         // Enter in either field submits (mstsc-style login).
                         let want_submit = ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -946,11 +975,29 @@ impl App {
                                         ui.end_row();
 
                                         ui.label("Password:");
-                                        ui.add(
-                                            egui::TextEdit::singleline(&mut state.draft.password)
-                                                .password(!state.draft.remember_password)
-                                                .desired_width((form_width - 160.0).max(80.0)),
-                                        );
+                                        ui.horizontal(|ui| {
+                                            ui.add(
+                                                egui::TextEdit::singleline(
+                                                    &mut state.draft.password,
+                                                )
+                                                // Masked until the user asks to
+                                                // review it (eye toggle),
+                                                // regardless of Remember.
+                                                .password(!state.show_password),
+                                            );
+                                            let (icon, tip) = if state.show_password {
+                                                ("👁", "Hide password")
+                                            } else {
+                                                ("‥", "Show password")
+                                            };
+                                            if ui
+                                                .small_button(icon)
+                                                .on_hover_text(tip)
+                                                .clicked()
+                                            {
+                                                state.show_password = !state.show_password;
+                                            }
+                                        });
                                         ui.end_row();
 
                                         ui.label("Remember:");
@@ -1224,17 +1271,16 @@ impl App {
         }
 
         // Vault sign-in/sign-out declared in the frame, applied here outside
-        // the borrows. Sign-in hands over to the lock screen; sign-out drops
-        // the key and re-renders the manager with rehydration off.
+        // the borrows. Both hand over to the lock screen; sign-out drops the
+        // key and any decrypted data before it does.
         if vault_sign_in {
-            let creating = !vault::Vault::exists();
-            return Some(VaultFlow::SignIn { creating });
+            return Some(VaultFlow::SignIn { creating: false });
         }
         if vault_kill {
             vault.lock();
-            state.error = None;
             // The in-memory profile list may carry decrypted passwords from
-            // rehydration; drop them before the vault goes dark.
+            // rehydration; drop them before the vault goes dark. The lock
+            // screen (not the manager) asks for the master passphrase next.
             for p in profiles.iter_mut() {
                 p.password.clear();
             }
@@ -1242,6 +1288,7 @@ impl App {
                 gateway.password.clear();
             }
             state.draft.password.clear();
+            return Some(VaultFlow::SignIn { creating: false });
         }
         None
     }

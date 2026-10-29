@@ -71,45 +71,57 @@ Legend: ✅ works · ⚠️ partial (protocol supported, UX incomplete) · ❌ n
 | TLS certificate validation | ⚠️ | Strict on/off toggle; mstsc shows an interactive prompt instead |
 | Interactive credential prompt | ❌ | Credentials come from the manager UI / CLI; failed NLA returns an error |
 | Multi-monitor | ✅ | 1–4 horizontal remote screens; the connection bar picks **All screens** or a single screen to view (mouse coordinates remapped; view-only, no reconnect) |
-| Window title | ✅ | `<profile name> — rstsc` in a session, `rstsc` in the manager |
+| Window title | ✅ | `<profile name> — rstsc` in a session, `rstsc` in the manager, `rstsc — locked` on the lock screen |
 | Bitmap cache / orders / caps | ✅ | Engine-internal |
-| Save/load connections | ✅ | JSON profiles; imports mstsc `.rdp` files |
+| Save/load connections | ✅ | Sealed in the vault; imports mstsc `.rdp` files |
 | Location redirection | ➖ | Engine supports it (feature `client-location` enabled); needs OS location source |
 | WebAuthn redirection | ➖ | Upstream path is Windows-hosted; N/A on Linux |
 | Hyper-V VM Connect | ➖ | Engine feature exists (`vmconnect`); not wired in this build |
+| Password vault | ✅ | Master passphrase on a lock screen; Skip = no vault access; password masked in the form with a reveal toggle |
 
 ## Connection manager
 
-- Left rail: saved profiles (single click = select, double click = connect),
-  Save/Delete buttons.
+- Lock screen first: enter the master passphrase (Unlock), create one on
+  first run (Create vault), or press **Skip** to use the app without stored
+  passwords — skipping never reads the vault; saved passwords stay locked.
+  Sign out returns here.
+- Left rail: app title with a **Sign out** button (visible while unlocked),
+  vault status line ("vault unlocked · N passwords" or a clickable
+  🔒 sign-in link when locked), saved profiles (single click = select,
+  double click = connect), and a **＋ New** button that clears the form for
+  a fresh profile, plus Save/Delete.
 - Right column: new/edit form (Profile name, Computer, User name, Password,
   Remember, Display, Advanced), with the **Connect** / **Open .rdp…** action
   row pinned at the bottom of the column — the form scrolls, the buttons
-  don't.
+  don't. The password field is masked; a small 👁/‥ button beside it reveals
+  it until toggled back.
 - Profile naming is free-form; empty falls back to the host part of the
-  address. Renaming a profile moves its stored password with it.
+  address. Renaming a profile moves its stored password **and** sealed
+  settings with it.
 
 ## Password vault
 
-Remembered RDP passwords (and the optional RD Gateway password) never hit
-disk in plaintext:
+Remembered passwords (RDP + optional RD Gateway) and the profile settings
+themselves never hit disk unencrypted:
 
 - Storage: `${XDG_CONFIG_HOME:-~/.config}/rstsc/secrets.vault`, mode
-  0600, atomically written via `rename`. Each profile's password is an
-  independent AEAD ciphertext (ChaCha20-Poly1305) keyed by the profile name.
-- The vault key is derived from a master passphrase with Argon2id
-  (19 MiB memory cost, 2 passes). The passphrase is entered once per app
-  start (form → *Master passphrase* → Create/Unlock) and lives only in
-  memory; zeroized on lock/exit — *Lock vault* forgets it immediately.
-- `profiles.json` intentionally carries no passwords: *Remember* stores into
-  the vault and connects rehydrate from it on any path (list double-click,
-  Connect button, `-p`/`-r`/bare-address launches).
+  0600, atomically written via `rename`. Each entry is an independent AEAD
+  ciphertext (ChaCha20-Poly1305):
+  - `<name>` — the profile's password,
+  - `profile/<name>` — the full connection settings as sealed JSON.
+- The vault key is derived from a master passphrase with Argon2id (19 MiB
+  memory cost, 2 passes). The passphrase is asked on the lock screen once
+  per app start and lives only in memory; zeroized on sign out or exit.
+- After unlock, the connection manager lists profiles from the vault;
+  `profiles.json` is only a fallback (pre-unlock CLI lookups) and the
+  migration source. New saves go to the vault whenever it is unlocked.
 - Profiles from older versions carrying plaintext passwords are migrated
-  into the vault and scrubbed from disk the first time the vault is
-  unlocked.
+  into the vault (password + sealed settings) and scrubbed from disk the
+  first time the vault is unlocked.
 - Bare-address quick-connect (`rstsc host`) connects without stored
   credentials; use `-p <profile>` for remembered passwords, or type them in
-  the form.
+  the form. With the vault skipped/locked, `-p` still launches (settings
+  from `profiles.json`) but sends no password.
 
 ## Security notes
 
