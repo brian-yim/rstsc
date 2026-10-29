@@ -251,6 +251,75 @@ impl eframe::App for App {
                 s.drain_input(ctx);
             }
         }
+        // egui-winit's clipboard shortcut interception is OFF (see main.rs):
+        // forwarded Ctrl+C/X/V reach egui as plain Key events, which TextEdit
+        // would type instead of treating as clipboard commands. On the
+        // manager screen (no remote surface), synthesize the corresponding
+        // egui events. Paste reads the platform clipboard via arboard here —
+        // safe because no session mirror can own the clipboard while the
+        // manager screen is active.
+        if matches!(self.screen, Screen::Manager(_)) {
+            let shortcut_keys: Vec<egui::Key> = ctx.input(|i| {
+                i.raw
+                    .events
+                    .iter()
+                    .filter_map(|event| {
+                        if let egui::Event::Key {
+                            key,
+                            pressed: true,
+                            modifiers:
+                                egui::Modifiers {
+                                    ctrl: true,
+                                    shift: false,
+                                    ..
+                                },
+                            ..
+                        } = event
+                        {
+                            if matches!(key, egui::Key::C | egui::Key::X | egui::Key::V) {
+                                Some(*key)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            });
+            if !shortcut_keys.is_empty() {
+                // The plain keys must not also type 'c'/'x'/'v' into a
+                // focused field: drop them, then push the real clipboard
+                // events.
+                ctx.input_mut(|i| {
+                    i.raw.events.retain(|event| {
+                        !matches!(
+                            event,
+                            egui::Event::Key {
+                                key,
+                                pressed: true,
+                                modifiers: egui::Modifiers { ctrl: true, .. },
+                                ..
+                            } if shortcut_keys.contains(key)
+                        )
+                    });
+                });
+                for key in shortcut_keys {
+                    let event = match key {
+                        egui::Key::V => {
+                            let text = arboard::Clipboard::new()
+                                .ok()
+                                .and_then(|mut c| c.get_text().ok())
+                                .unwrap_or_default();
+                            egui::Event::Paste(text)
+                        }
+                        egui::Key::X => egui::Event::Cut,
+                        _ => egui::Event::Copy,
+                    };
+                    ctx.input_mut(|i| i.raw.events.push(event));
+                }
+            }
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1195,34 +1264,6 @@ impl SessionState {
 
         for event in events {
             match event {
-                // egui-winit's shortcut interception turns Ctrl+C/X/V into
-                // commands and drops the key events. When the pointer is over
-                // the remote surface, the user meant them for the remote:
-                // re-inject the C/X/V scancodes (modifiers are refreshed by
-                // the modifiers-diff that precedes the command event).
-                egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_)
-                    if surface
-                        .zip(self.last_pos)
-                        .map(|(rect, pos)| rect.contains(pos))
-                        .unwrap_or(false) =>
-                {
-                    if let Some(modifiers) = self.mods.last() {
-                        for (sc, down) in self.mods.diff(modifiers) {
-                            ops.push(op_key(sc, down));
-                        }
-                    }
-                    let sc = match event {
-                        egui::Event::Cut => crate::keymap::map_key(egui::Key::X),
-                        egui::Event::Copy => crate::keymap::map_key(egui::Key::C),
-                        egui::Event::Paste(_) => crate::keymap::map_key(egui::Key::V),
-                        _ => unreachable!(),
-                    };
-                    // Press + release so the remote sees the full keystroke.
-                    if let Some(sc) = sc {
-                        ops.push(op_key(sc, true));
-                        ops.push(op_key(sc, false));
-                    }
-                }
                 egui::Event::Key {
                     key,
                     physical_key,
@@ -1364,6 +1405,7 @@ impl SessionState {
             return;
         }
         let batch = self.input_db.apply(ops);
+        tracing::debug!(events = batch.len(), "Sending input batch to remote");
         let _ = self
             .handle
             .input

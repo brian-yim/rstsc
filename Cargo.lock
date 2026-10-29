@@ -5143,6 +5143,7 @@ name = "rstsc"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arboard",
  "argon2",
  "base64 0.23.1",
  "chacha20poly1305",

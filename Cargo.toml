@@ -51,6 +51,10 @@ eframe = "0.37"
 egui = "0.37"
 image = { version = "0.25", default-features = false, features = ["png"] }
 rfd = "0.17"
+# Manager-screen clipboard reads (paste into text fields) — the same backend
+# egui-winit uses, kept explicit so the app controls when the (blocking) X11
+#/Wayland read happens.
+arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
 
 # Async runtime for the session driver thread
 tokio = { version = "1", features = ["rt", "macros", "time"] }

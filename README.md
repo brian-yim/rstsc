@@ -12,12 +12,20 @@ connection manager, and Linux integration (X11/Wayland clipboard and input).
 ## Build & run
 
 ```sh
-cargo build --release
+./install.sh                              # build + install to /usr/local (sudo) or ~/.local
+./install.sh --user                       # force ~/.local, no root
+./install.sh --uninstall                  # remove installed files
+cargo build --release                     # plain build, no install
 ./target/release/rstsc                    # connection manager GUI
 ./target/release/rstsc host[:port]        # quick connect
 ./target/release/rstsc -p myprofile -f    # saved profile, fullscreen
 ./target/release/rstsc -r ~/some.rdp      # mstsc .rdp file
 ```
+
+`install.sh` builds from source (no RPM needed), installs the binary, the
+desktop entry and all hicolor icons, registers the `rdp://` URL handler, and
+installs Rust via rustup if the distro toolchain is older than 1.94. With ALSA
+headers present it enables the `audio` feature automatically.
 
 Requirements: Rust ≥ 1.94, X11 or Wayland. Network access to fetch the pinned
 IronRDP git deps on first build.
@@ -44,8 +52,8 @@ Legend: ✅ works · ⚠️ partial (protocol supported, UX incomplete) · ❌ n
 | Connection bar | ✅ | Title (profile/host), per-screen picker, Fit, Fullscreen, Ctrl+Alt+Del, Disconnect |
 | Server-supplied cursors (bitmaps) | ✅ | |
 | Clipboard: text + images | ✅ | X11/Wayland via `ironrdp-cliprdr-native` |
-| Clipboard: keyboard shortcuts | ✅ | Ctrl+C/X/V route by pointer position: remote surface gets the keystrokes, local text fields get egui's clipboard |
-| Clipboard: file copy/paste | ✅ | Copy/paste in both directions; dropping local files on the client surface offers them to the remote |
+| Clipboard: keyboard shortcuts | ✅ | Ctrl+C/X/V route by pointer position: remote surface gets the keystrokes directly (no local clipboard read), local text fields get egui's clipboard |
+| Clipboard: file copy/paste | ✅ | Copy/paste in both directions; dropping local files on the client surface offers them to the remote. Remote file lists are mirrored lazily: downloads start on the first local paste (or after a 10 s grace), so the remote's rdpclip stream state isn't churned by eager requests |
 | Drive redirection (RDPDR) | ✅ | Share a local folder as a drive (Advanced → Shared folder); full read/write via upstream `NixRdpdrBackend` |
 | Printer / port / smartcard / PnP redirect | ❌ | Needs backend implementations (drive redirection is done; the same trait surface covers the rest) |
 | Remote audio playback | ✅ | `--features audio` (cpal/ALSA) |

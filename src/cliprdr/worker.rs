@@ -17,7 +17,7 @@ use ironrdp_cliprdr::pdu::{
 };
 use ironrdp_cliprdr_format::bitmap;
 use ironrdp_core::IntoOwned as _;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::data_control::find_mime_match;
 use super::files::{self, GNOME_COPIED_FILES, URI_LIST};
@@ -100,6 +100,14 @@ pub struct Worker<O, P> {
     download_budget: u64,
     empty_selection_since: Option<Instant>,
     loops: LoopDetector,
+    /// File list announced by the remote whose downloads are deferred until a
+    /// local application actually pastes; `None` when nothing is pending.
+    pending_remote_files: Option<(Vec<FileDescriptor>, Option<u32>)>,
+    /// When the deferral of `pending_remote_files` began (for the auto-start).
+    deferral_since: Option<Instant>,
+    /// Whether the init-time (empty) format list was already sent; real
+    /// content announces happen only on genuine local copies afterwards.
+    init_advertised: bool,
 }
 
 impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
@@ -129,6 +137,9 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
             download_budget: files::MAX_FILE_BYTES,
             empty_selection_since: None,
             loops: LoopDetector::new(),
+            pending_remote_files: None,
+            deferral_since: None,
+            init_advertised: false,
         }
     }
 
@@ -182,12 +193,29 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
                     })
                     .map(|format| format.id());
                 // A pure file-list re-announcement of content we have
-                // already staged (rdpclip re-announces regularly) must not
+                // already staged (rdpclip re-announces regularly — Windows
+                // Explorer pairs FileGroupDescriptorW with "Preferred
+                // DropEffect", so the list is two formats, not one) must not
                 // tear the mirror down: clearing X11 ownership and the
-                // staging directory mid-paste breaks readers. The handler
-                // below in `remote_file_list` short-circuits unchanged
-                // content via the stored fingerprint.
-                if self.remote_file_list_format.is_some() && formats.len() == 1 {
+                // staging directory mid-paste breaks readers, and the
+                // owner churn makes rdpclip re-announce again (ping-pong of
+                // format lists on the wire, during which pastes on the
+                // remote resolve against a clipboard that keeps changing —
+                // Explorer paste silently does nothing). The handler below
+                // in `remote_file_list` short-circuits unchanged content
+                // via the stored fingerprint, so any file-list-only
+                // announcement is safe to keep: it either restages content
+                // that actually changed or keeps the current mirror.
+                if self.remote_file_list_format.is_some()
+                    && !formats.iter().any(|format| {
+                        matches!(
+                            format.id(),
+                            ClipboardFormatId::CF_UNICODETEXT
+                                | ClipboardFormatId::CF_DIB
+                                | ClipboardFormatId::CF_DIBV5
+                        )
+                    })
+                {
                     self.remote = formats;
                     self.owns_remote = true;
                     self.request_remote_file_list();
@@ -277,6 +305,8 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
                 self.local_files.clear();
                 self.locked_uploads.clear();
                 self.remote_file_list_format = None;
+                self.pending_remote_files = None;
+                self.deferral_since = None;
                 self.loops.clear();
             }
             Command::Shutdown => {}
@@ -290,6 +320,8 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
         self.local_files.clear();
         self.downloads.clear();
         self.active_download = None;
+        self.pending_remote_files = None;
+        self.deferral_since = None;
         self.staged_files.clear();
         self.staged_fingerprint.clear();
         self.clear_staging();
@@ -354,6 +386,30 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
         // (Capabilities + Temporary Directory + Format List); skipping it
         // leaves the channel in Initialization state forever and `on_ready`
         // never fires. It must always go out, whatever the clipboard holds.
+        //
+        // BUT a FormatList carrying actual formats REPLACES the remote's
+        // clipboard (rdpclip re-registers its content, destroying the shell's
+        // pending file-copy object the user may still want to paste on the
+        // remote). mstsc does not announce its clipboard at connection time —
+        // it only reacts to user copies. Match that: send an EMPTY list when
+        // fulfilling the init handshake, and announce real content only in
+        // response to a genuine LocalChanged (a copy made locally while
+        // connected). The first genuine LocalChanged after `init_advertised`
+        // carries the full content.
+        if !self.init_advertised {
+            self.init_advertised = true;
+            if !local_mimes.is_empty() {
+                debug!(
+                    ?local_mimes,
+                    "Init handshake: announcing empty formats; real local content advertises on the first LocalChanged"
+                );
+                self.proxy
+                    .send_clipboard_message(ClipboardMessage::SendInitiateCopy(Vec::new()));
+                // Pre-connection local content is NOT sent proactively; the
+                // next genuine LocalChanged announces it.
+                return;
+            }
+        }
         let mut formats = Vec::new();
         if find_mime_match(TEXT, &local_mimes).is_some() {
             formats.push(ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT));
@@ -433,10 +489,35 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
     }
 
     fn paste(&mut self, transfer: Transfer) {
+        debug!(
+            mime = %transfer.mime_type(),
+            generation = transfer.generation(),
+            current = self.generation,
+            owns_remote = self.owns_remote,
+            "OS paste request received"
+        );
         if !self.owns_remote || transfer.generation() != self.generation {
             return;
         }
         if matches!(transfer.mime_type(), URI_LIST | GNOME_COPIED_FILES) {
+            if self.active_download.is_none()
+                && self.downloads.is_empty()
+                && self.staged_files.is_empty()
+                && self.pending_remote_files.is_some()
+            {
+                // First local paste of the mirrored file clipboard:
+                // download the deferred list now, ask this paste to retry.
+                info!(
+                    mime = %transfer.mime_type(),
+                    "Local paste requested the staged URIs; starting deferred downloads"
+                );
+                self.begin_pending_downloads();
+                // Data is not ready yet; close this paste. The re-announce at
+                // staging completion lets the next paste succeed. (GTK
+                // applications typically re-paste on user retry.)
+                transfer.finish(None);
+                return;
+            }
             if self.active_download.is_none()
                 && self.downloads.is_empty()
                 && !self.staged_files.is_empty()
@@ -521,11 +602,34 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
                 && pending.generation == self.generation
                 && Some(pending.format) == self.remote_file_list_format
         });
+        // Deferred downloads auto-begin after a short grace period: the remote
+        // keeps its file stream data under a lock that expires after 60s of
+        // inactivity, so waiting for a local paste forever risks serving the
+        // URIs from an expired stream. 10s covers a human pasting at normal
+        // speed and stays far inside the lock window.
+        if self.pending_remote_files.is_some()
+            && self.deferral_since
+                .is_some_and(|since| now.saturating_duration_since(since) >= FILE_TIMEOUT)
+        {
+            info!("Starting deferred remote file downloads after the paste grace period");
+            self.begin_pending_downloads();
+        }
         if let Some(pending) = &mut self.pending {
             if pending.deadline <= now {
                 pending.expired = true;
                 pending.waiters.clear();
             }
+        }
+        // A timed-out file-list request must retire its `pending` slot: it is
+        // the gate for `request_remote_file_list()`, and no file-list response
+        // will ever otherwise arrive to clear it. Keeping it wedged the whole
+        // file clipboard across every later re-announcement (rdpclip
+        // re-announces the format list, the shortcut calls
+        // `request_remote_file_list()`, it refuses while `pending` is set).
+        // The epoch check in `remote_file_list()` already identifies a truly
+        // late reply, so an unused retired slot cannot misattribute one.
+        if file_list_expired {
+            self.pending = None;
         }
         self.queue.retain(|queued| now < queued.deadline);
         if self
@@ -708,7 +812,11 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
         }) {
             mimes.push(PNG.to_owned());
         }
-        if !self.staged_files.is_empty() {
+        // Files may still be deferred (`pending_remote_files`); the X11 offer is
+        // delayed-rendered anyway — the URIs are served from `staged_files` only
+        // after the deferred downloads finish, so advertising them now claims
+        // ownership without needing the data yet.
+        if !self.staged_files.is_empty() || self.pending_remote_files.is_some() {
             mimes.extend([URI_LIST.to_owned(), GNOME_COPIED_FILES.to_owned()]);
         }
         if mimes.is_empty() {
@@ -762,6 +870,27 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
             }
             return;
         }
+        // Defer downloading: hold the announced list until a local
+        // application actually pastes the file URIs. An eager
+        // FileContentsRequest per announcement (rdpclip re-announces the
+        // same list often) forces the remote's rdpclip to open/close a
+        // file stream every few seconds, which interacts badly with its
+        // single-stream serving state and wedges the LOCAL file paste
+        // path on the remote itself (observed: Explorer's Ctrl+V doing
+        // nothing while rstsc is connected). Stage on real demand only.
+        self.pending_remote_files = Some((files, clip_data_id));
+        self.deferral_since = Some(Instant::now());
+        self.offer_remote();
+    }
+
+    /// Kicks deferred remote file downloads; called when something pastes the
+    /// staged URIs or when the mirror needs real files.
+    fn begin_pending_downloads(&mut self) {
+        let Some((files, clip_data_id)) = self.pending_remote_files.take() else {
+            self.deferral_since = None;
+            return;
+        };
+        self.deferral_since = None;
         match self.prepare_downloads(&files, clip_data_id) {
             Ok(()) => self.start_next_download(),
             Err(error) => {
@@ -1116,28 +1245,32 @@ mod tests {
         let mut worker = Worker::new(clipboard, Recorder(Arc::clone(&messages)), None);
 
         worker.handle(Command::AdvertiseLocal);
-        // The init answer (`SendInitiateCopy` with no text/image formats)
-        // must go out even when the clipboard only holds files; the file
-        // offer itself waits for `BackendReady`.
+        // Init handshake announces an EMPTY format list (replacing nothing on
+        // the remote); pre-connection local files are withheld until a
+        // genuine local change or BackendReady. The worker must NOT advertise
+        // content at init.
         assert!(
             matches!(&messages.lock().unwrap()[..], [ClipboardMessage::SendInitiateCopy(formats)] if formats.is_empty()),
-            "init format list must always be sent for channel initialization"
+            "init format list must be empty and complete the initialization"
         );
-        assert!(worker.advertise_when_ready);
+        assert!(!worker.advertise_when_ready);
 
+        // The channel becomes ready while the files sit on the local OS
+        // clipboard untouched: on_ready sees nothing to advertise (no
+        // LocalChanged since connect). The files flow on the next genuine
+        // local event. Simulate one: a LocalChanged now that the channel is
+        // READY must produce the full announce (format list + file offer).
         worker.handle(Command::BackendReady);
         assert!(!worker.advertise_when_ready);
-        // On ready the deferred offer is sent by re-advertising, which
-        // emits a fresh init format list first, then the file list.
+        worker.handle(Command::LocalChanged);
         let messages = messages.lock().unwrap();
         assert!(matches!(
-            &messages[messages.len() - 1],
-            ClipboardMessage::SendInitiateFileCopy(files)
-            if files.len() == 1 && files[0].name == "upload.txt"
-        ));
-        assert!(matches!(
-            &messages[messages.len() - 2],
-            ClipboardMessage::SendInitiateCopy(_)
+            &messages[..],
+            [
+                ClipboardMessage::SendInitiateCopy(_),
+                ClipboardMessage::SendInitiateCopy(_),
+                ClipboardMessage::SendInitiateFileCopy(files)
+            ] if files.len() == 1 && files[0].name == "upload.txt"
         ));
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1184,12 +1317,23 @@ mod tests {
         worker.ready = true;
 
         worker.handle(Command::LocalChanged);
+        // First change with an empty local selection: wrung through the
+        // debounce (nothing announced yet).
         assert!(
             messages.lock().unwrap().is_empty(),
             "empty selection during handoff should be deferred"
         );
-        worker.os.mimes.lock().unwrap().push(URI_LIST.to_owned());
+        // Debounce elapses: the init handshake gets satisfied ONCE with an
+        // empty format list (announcing nothing on the remote).
         worker.expire(Instant::now() + EMPTY_SELECTION_DEBOUNCE);
+        assert!(
+            matches!(&messages.lock().unwrap()[..], [ClipboardMessage::SendInitiateCopy(formats)] if formats.is_empty()),
+            "debounced empty selection fulfills the init handshake with an empty list"
+        );
+
+        // A genuine local file copy arrives: full announce.
+        worker.os.mimes.lock().unwrap().push(URI_LIST.to_owned());
+        worker.handle(Command::LocalChanged);
 
         let messages = messages.lock().unwrap();
         assert!(matches!(
@@ -1281,6 +1425,34 @@ mod tests {
         );
     }
     #[test]
+    fn timed_out_file_list_request_arms_again_on_reannouncement() {
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let mut worker = Worker::new(FakeClipboard, Recorder(Arc::clone(&messages)), None);
+        let format = ClipboardFormat::new(ClipboardFormatId::new(0xC0DE))
+            .with_name(ClipboardFormatName::FILE_LIST);
+
+        // First announcement arms a file-list request that is never answered.
+        worker.handle(Command::RemoteCopy(vec![format.clone()], 1));
+        assert!(worker.pending.is_some());
+        // The paste request times out (rdpclip busy).
+        worker.expire(Instant::now() + PASTE_TIMEOUT);
+        assert!(worker.remote_file_list_format.is_none());
+
+        // rdpclip re-announces the same clipboard: a fresh request must be sent
+        // instead of being blocked by the retired-but-still-set `pending` slot.
+        worker.handle(Command::RemoteCopy(vec![format], 2));
+        let send_pastes = messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| matches!(m, ClipboardMessage::SendInitiatePaste(_)))
+            .count();
+        assert_eq!(
+            send_pastes, 2,
+            "second announcement must arm another file-list paste request"
+        );
+    }
+    #[test]
     fn identical_remote_file_list_reannouncement_keeps_staging() {
         let root =
             std::env::temp_dir().join(format!("rstsc-restage-test-{}", std::process::id()));
@@ -1304,6 +1476,9 @@ mod tests {
             Some(1),
             1,
         ));
+        // The list is held deferred now; a local paste of the URIs starts the
+        // downloads.
+        worker.begin_pending_downloads();
         // Download completes.
         worker.handle(Command::RemoteFileData(
             FileContentsResponse::new_data_response(1, vec![0_u8; 4096]).into_owned(),
@@ -1325,5 +1500,52 @@ mod tests {
         assert_eq!(worker.staging_dir.as_ref(), Some(&staged_dir));
         assert!(staged_dir.exists());
         let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
+    fn remote_file_list_is_deferred_until_local_paste() {
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let mut worker = Worker::new(FakeClipboard, Recorder(Arc::clone(&messages)), None);
+        let format = ClipboardFormat::new(ClipboardFormatId::new(0xC0DE))
+            .with_name(ClipboardFormatName::FILE_LIST);
+        worker.ready = true;
+
+        // Remote announces a file list: no FileContentsRequest may be sent
+        // eagerly (it wedges rdpclip's stream state and breaks remote→self
+        // pastes); the list is held.
+        worker.handle(Command::RemoteCopy(vec![format], 1));
+        worker.handle(Command::RemoteFileList(
+            vec![FileDescriptor::new("deferred.bin").with_file_size(4)],
+            Some(1),
+            1,
+        ));
+        assert!(
+            worker.pending_remote_files.is_some(),
+            "fresh remote file list must be held for deferred staging"
+        );
+        assert!(worker.staging_dir.is_none(), "nothing backed yet");
+        let wire_requests_early = messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| matches!(m, ClipboardMessage::SendFileContentsRequest(_)))
+            .count();
+        assert_eq!(
+            wire_requests_early, 0,
+            "no file contents request may go out before a local paste"
+        );
+
+        // A local paste of the file URIs starts the downloads.
+        worker.expire(Instant::now() + FILE_TIMEOUT);
+        let wire_requests_after = messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| matches!(m, ClipboardMessage::SendFileContentsRequest(_)))
+            .count();
+        assert_eq!(
+            wire_requests_after, 1,
+            "deferred downloads must begin after the paste grace period"
+        );
+        assert!(worker.pending_remote_files.is_none());
     }
 }

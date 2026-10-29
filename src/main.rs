@@ -143,12 +143,16 @@ fn main() -> anyhow::Result<()> {
             // largest size Wayland compositors reliably take from an app;
             // the X11 property path also accepts it.
             .with_icon(icon_data()),
-        // egui-winit's built-in copy/cut/paste handling stays ON so that
-        // Ctrl+C/X/V work in the connection-manager's own text fields.
-        // When those commands arrive while the pointer is over the remote
-        // surface, `drain_input` re-injects the C/X/V scancodes into the
-        // session so the remote still receives its shortcuts.
-        clipboard_shortcuts: true,
+        // egui-winit's built-in copy/cut/paste handling must stay OFF: on
+        // Ctrl+V it synchronously reads the OS clipboard (arboard), and when
+        // the session's file mirror owns the clipboard with only URI formats
+        // that read returns empty — then egui-winit DROPS the keystroke
+        // entirely (no Paste event AND no Key event), so a Ctrl+V aimed at
+        // the remote never reaches Windows. With the interception off, the
+        // keys flow as plain Key events: `drain_input` re-injects them over
+        // the remote surface, and the manager screen synthesizes local
+        // clipboard commands itself.
+        clipboard_shortcuts: false,
         wgpu_options,
         ..Default::default()
     };
