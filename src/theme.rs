@@ -72,12 +72,25 @@ pub fn primary_button(text: &str) -> egui::Button {
     .min_size(egui::vec2(120.0, 32.0))
 }
 
-/// Square ghost button for inline glyph icons (eye toggle, ✕, …). Panel
-/// fill with a hairline stroke; the glyph is drawn in `color`.
-pub fn icon_button(glyph: &str, color: egui::Color32) -> egui::Button<'static> {
-    egui::Button::new(egui::RichText::new(glyph.to_owned()).color(color).size(14.0))
-        .fill(BG_PANEL)
-        .stroke(egui::Stroke::new(1.0, STROKE))
-        .corner_radius(egui::CornerRadius::same(5))
-        .min_size(egui::vec2(26.0, 26.0))
+/// Lucide "eye" / "eye-off" (white stroke) for the password reveal toggle.
+/// Embedded PNG bytes, cached by egui's bytes loader; tinted at draw.
+mod icons {
+    pub const EYE: &[u8] = include_bytes!("../assets/icons/eye.png");
+    pub const EYE_OFF: &[u8] = include_bytes!("../assets/icons/eye-off.png");
+}
+
+/// The password-reveal icon: Lucide eye (password masked) or eye-off
+/// (revealed), 16×16, sized for the ghost-square button at the call site.
+/// `hovered` requests the accent tint, otherwise muted.
+pub fn eye_icon(hidden: bool, hovered: bool) -> egui::Image<'static> {
+    let bytes = if hidden { icons::EYE } else { icons::EYE_OFF };
+    // Distinct cache URIs: switching icons must not hit the other's cache.
+    let uri = if hidden { "bytes://rstsc/eye.png" } else { "bytes://rstsc/eye-off.png" };
+    egui::Image::from_bytes(uri, bytes)
+        .fit_to_exact_size(egui::Vec2::splat(16.0))
+        .tint(tint_for(hovered))
+}
+
+fn tint_for(hovered: bool) -> egui::Color32 {
+    if hovered { ACCENT_HOVER } else { TEXT_MUTED }
 }

@@ -982,22 +982,50 @@ impl App {
                                                 .password(!state.show_password)
                                                 .desired_width((form_width - 196.0).max(80.0)),
                                             );
-                                            let (glyph, tip, color) = if state.show_password {
-                                                (
-                                                    "◆",
-                                                    "Hide password",
-                                                    crate::theme::ACCENT_HOVER,
+                                            // Lucide reveal toggle inside a
+                                            // ghost square; hover = accent.
+                                            let (hidden, tip) = if state.show_password {
+                                                (false, "Hide password")
+                                            } else {
+                                                (true, "Show password")
+                                            };
+                                            let (rect, toggle) = ui.allocate_exact_size(
+                                                egui::vec2(26.0, 26.0),
+                                                egui::Sense::click(),
+                                            );
+                                            let hovered = toggle.hovered();
+                                            // Accent stroke on hover; hairline
+                                            // otherwise (mirrors widget hover
+                                            // styling from theme.rs).
+                                            let stroke = if hovered {
+                                                egui::Stroke::new(
+                                                    1.0,
+                                                    crate::theme::ACCENT.gamma_multiply(0.4),
                                                 )
                                             } else {
-                                                ("◇", "Show password", crate::theme::TEXT_MUTED)
+                                                egui::Stroke::new(1.0, crate::theme::STROKE)
                                             };
-                                            let toggle = ui
-                                                .add(crate::theme::icon_button(glyph, color))
-                                                .on_hover_text(tip);
-                                            if toggle.clicked() {
+                                            ui.painter().rect_filled(
+                                                rect,
+                                                5.0,
+                                                if hovered {
+                                                    crate::theme::BG_HOVER
+                                                } else {
+                                                    crate::theme::BG_PANEL
+                                                },
+                                            );
+                                            ui.painter().rect_stroke(
+                                                rect, 5.0, stroke, egui::StrokeKind::Inside,
+                                            );
+                                            ui.put(
+                                                rect.shrink2(egui::vec2(5.0, 5.0)),
+                                                crate::theme::eye_icon(hidden, hovered),
+                                            );
+                                            let clicked = toggle.clicked();
+                                            toggle.on_hover_text(tip);
+                                            if clicked {
                                                 state.show_password = !state.show_password;
                                             }
-                                            toggle
                                         });
                                         ui.end_row();
 
