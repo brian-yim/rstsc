@@ -48,6 +48,8 @@ pub struct App {
     vault: vault::Vault,
     /// Window title last pushed to the compositor (dedup Title commands).
     reported_title: Option<String>,
+    /// Preloaded Lucide eye/eye-off textures for the password toggle.
+    eye_icons: crate::theme::EyeIcons,
 }
 
 struct ManagerState {
@@ -216,6 +218,7 @@ impl App {
             pending_launch: None,
             reported_title: None,
             vault,
+            eye_icons: crate::theme::load_eye_icons(&_cc.egui_ctx),
         }
     }
 
@@ -444,21 +447,18 @@ impl eframe::App for App {
                     // Zeroize the passphrases no matter how the unlock goes.
                 }
                 Some(LockOutcome::Skip) => {
-                    // Bypass: no vault access at all. The deferred CLI
-                    // launch (if any) proceeds, but any vault-rehydrated
-                    // password is stripped so nothing decrypts on skip.
+                    // Bypass: nothing imported from the vault or
+                    // profiles.json. The CLI launch (if any) proceeds with
+                    // its own fresh credentials; the manager starts empty
+                    // (data on disk is untouched).
                     if let Some((p, _)) = self.launch_after_unlock.as_mut() {
                         p.password.clear();
                         if let Some(gateway) = &mut p.gateway {
                             gateway.password.clear();
                         }
                     }
+                    self.profiles.clear();
                     self.back_to_manager(None);
-                    // Manager works from the non-vault copy (profiles.json /
-                    // CLI arg); no vault reads, no rehydration.
-                    for p in self.profiles.iter_mut() {
-                        p.password.clear();
-                    }
                 }
                 None => {}
             }
@@ -477,10 +477,11 @@ impl eframe::App for App {
                     profiles,
                     pending_launch,
                     vault,
+                    eye_icons,
                     ..
                 } = self;
                 let m = &mut **m;
-                vault_flow = App::draw_manager(vault, ui, m, profiles, pending_launch);
+                vault_flow = App::draw_manager(vault, ui, m, profiles, pending_launch, eye_icons);
             });
             if let Some(VaultFlow::SignIn { creating }) = vault_flow {
                 self.screen = Screen::Lock(Box::new(LockState {
@@ -636,6 +637,7 @@ impl App {
         state: &mut ManagerState,
         profiles: &mut Vec<Profile>,
         pending: &mut Option<(Profile, bool)>,
+        eye_icons: &crate::theme::EyeIcons,
     ) -> Option<VaultFlow> {
         // Vault actions gathered from the frame; applied after drawing.
         let mut vault_sign_in = false;
@@ -1019,7 +1021,7 @@ impl App {
                                             );
                                             ui.put(
                                                 rect.shrink2(egui::vec2(5.0, 5.0)),
-                                                crate::theme::eye_icon(hidden, hovered),
+                                                crate::theme::eye_icon(eye_icons, hidden, hovered),
                                             );
                                             let clicked = toggle.clicked();
                                             toggle.on_hover_text(tip);

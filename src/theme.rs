@@ -72,25 +72,43 @@ pub fn primary_button(text: &str) -> egui::Button {
     .min_size(egui::vec2(120.0, 32.0))
 }
 
-/// Lucide "eye" / "eye-off" (white stroke) for the password reveal toggle.
-/// Embedded PNG bytes, cached by egui's bytes loader; tinted at draw.
+/// Lucide "eye" / "eye-off" (white strokes) for the password reveal toggle,
+/// decoded eagerly into egui textures at startup. No async bytes loader, no
+/// load failure path — the ⚠️-placeholder bug is impossible with textures.
 mod icons {
     pub const EYE: &[u8] = include_bytes!("../assets/icons/eye.png");
     pub const EYE_OFF: &[u8] = include_bytes!("../assets/icons/eye-off.png");
+
+    fn decode(bytes: &[u8]) -> egui::ColorImage {
+        let img = image::load_from_memory(bytes).expect("embedded eye icon is a valid PNG");
+        egui::ColorImage::from_rgba_unmultiplied(
+            [img.width() as usize, img.height() as usize],
+            img.to_rgba8().as_raw(),
+        )
+    }
+    pub fn eye() -> egui::ColorImage { decode(EYE) }
+    pub fn eye_off() -> egui::ColorImage { decode(EYE_OFF) }
 }
 
-/// The password-reveal icon: Lucide eye (password masked) or eye-off
-/// (revealed), 16×16, sized for the ghost-square button at the call site.
-/// `hovered` requests the accent tint, otherwise muted.
-pub fn eye_icon(hidden: bool, hovered: bool) -> egui::Image<'static> {
-    let bytes = if hidden { icons::EYE } else { icons::EYE_OFF };
-    // Distinct cache URIs: switching icons must not hit the other's cache.
-    let uri = if hidden { "bytes://rstsc/eye.png" } else { "bytes://rstsc/eye-off.png" };
-    egui::Image::from_bytes(uri, bytes)
-        .fit_to_exact_size(egui::Vec2::splat(16.0))
-        .tint(tint_for(hovered))
+/// Handles to both preloaded icon textures.
+pub struct EyeIcons {
+    pub masked: egui::TextureHandle,    // eye (password hidden)
+    pub revealed: egui::TextureHandle,  // eye-off (password visible)
 }
 
-fn tint_for(hovered: bool) -> egui::Color32 {
-    if hovered { ACCENT_HOVER } else { TEXT_MUTED }
+pub fn load_eye_icons(ctx: &egui::Context) -> EyeIcons {
+    EyeIcons {
+        masked: ctx.load_texture("rstsc-eye", icons::eye(), egui::TextureOptions::LINEAR),
+        revealed: ctx.load_texture("rstsc-eye-off", icons::eye_off(), egui::TextureOptions::LINEAR),
+    }
+}
+
+/// The password-reveal image: Lucide eye (password masked) or eye-off
+/// (revealed), drawn 16×16 with muted tint, accent while hovered.
+pub fn eye_icon(icons: &EyeIcons, hidden: bool, hovered: bool) -> egui::Image<'static> {
+    egui::Image::from_texture(egui::load::SizedTexture::new(
+        if hidden { &icons.masked } else { &icons.revealed },
+        egui::Vec2::splat(16.0),
+    ))
+    .tint(if hovered { ACCENT_HOVER } else { TEXT_MUTED })
 }
