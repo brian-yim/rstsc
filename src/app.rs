@@ -971,27 +971,33 @@ impl App {
 
                                         ui.label("Password:");
                                         ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 6.0;
+                                            // Masked until the user asks to
+                                            // review it (eye toggle),
+                                            // regardless of Remember.
                                             ui.add(
                                                 egui::TextEdit::singleline(
                                                     &mut state.draft.password,
                                                 )
-                                                // Masked until the user asks to
-                                                // review it (eye toggle),
-                                                // regardless of Remember.
-                                                .password(!state.show_password),
+                                                .password(!state.show_password)
+                                                .desired_width((form_width - 196.0).max(80.0)),
                                             );
-                                            let (icon, tip) = if state.show_password {
-                                                ("👁", "Hide password")
+                                            let (glyph, tip, color) = if state.show_password {
+                                                (
+                                                    "◆",
+                                                    "Hide password",
+                                                    crate::theme::ACCENT_HOVER,
+                                                )
                                             } else {
-                                                ("‥", "Show password")
+                                                ("◇", "Show password", crate::theme::TEXT_MUTED)
                                             };
-                                            if ui
-                                                .small_button(icon)
-                                                .on_hover_text(tip)
-                                                .clicked()
-                                            {
+                                            let toggle = ui
+                                                .add(crate::theme::icon_button(glyph, color))
+                                                .on_hover_text(tip);
+                                            if toggle.clicked() {
                                                 state.show_password = !state.show_password;
                                             }
+                                            toggle
                                         });
                                         ui.end_row();
 

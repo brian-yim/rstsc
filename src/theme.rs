@@ -71,3 +71,13 @@ pub fn primary_button(text: &str) -> egui::Button {
     .corner_radius(egui::CornerRadius::same(6))
     .min_size(egui::vec2(120.0, 32.0))
 }
+
+/// Square ghost button for inline glyph icons (eye toggle, ✕, …). Panel
+/// fill with a hairline stroke; the glyph is drawn in `color`.
+pub fn icon_button(glyph: &str, color: egui::Color32) -> egui::Button<'static> {
+    egui::Button::new(egui::RichText::new(glyph.to_owned()).color(color).size(14.0))
+        .fill(BG_PANEL)
+        .stroke(egui::Stroke::new(1.0, STROKE))
+        .corner_radius(egui::CornerRadius::same(5))
+        .min_size(egui::vec2(26.0, 26.0))
+}
